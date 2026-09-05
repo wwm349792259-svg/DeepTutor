@@ -1,0 +1,339 @@
+# ============================================
+# DeepTutor Multi-Stage Dockerfile (Production Only)
+# ============================================
+# This Dockerfile builds a production-ready image for DeepTutor
+# containing both the FastAPI backend and Next.js frontend
+# ============================================
+
+# ============================================
+# Stage 1: Frontend Builder
+# ============================================
+FROM --platform=$BUILDPLATFORM node:22-slim AS frontend-builder
+
+WORKDIR /app/web
+
+COPY web/package.json web/package-lock.json* ./
+
+RUN npm config set fetch-timeout 600000 && \
+    npm config set fetch-retries 5 && \
+    npm ci --legacy-peer-deps
+
+COPY web/ ./
+
+COPY deeptutor/__version__.py /app/deeptutor/__version__.py
+
+RUN printf 'NEXT_PUBLIC_APP_VERSION=\n' > .env.local
+
+RUN npm run build
+
+# ============================================
+# Stage 1b: Node Runtime for Target Platform
+# ============================================
+FROM node:22-slim AS node-runtime
+
+# ============================================
+# Stage 2: Python Base with Dependencies
+# ============================================
+FROM python:3.11-slim AS python-base
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONIOENCODING=utf-8 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    git \
+    build-essential \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+COPY requirements/ ./requirements/
+COPY requirements.txt ./
+RUN pip install --upgrade pip && \
+    pip install -r requirements.txt
+
+# ============================================
+# Stage 3: Production Image
+# ============================================
+FROM python:3.11-slim AS production
+
+LABEL maintainer="DeepTutor Team" \
+      description="DeepTutor: AI-Powered Personalized Learning Assistant"
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONIOENCODING=utf-8 \
+    MALLOC_ARENA_MAX=2 \
+    MALLOC_TRIM_THRESHOLD_=131072 \
+    NODE_ENV=production \
+    DEEPTUTOR_IGNORE_PROCESS_ENV_OVERRIDES=1
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    bash \
+    git \
+    supervisor \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-runtime /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+    && node --version && npm --version
+
+COPY --from=python-base /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=python-base /usr/local/bin /usr/local/bin
+
+COPY --from=frontend-builder /app/web/.next/standalone/ ./web/
+COPY --from=frontend-builder /app/web/.next/static/ ./web/.next/static/
+COPY --from=frontend-builder /app/web/public/ ./web/public/
+
+COPY deeptutor/ ./deeptutor/
+COPY deeptutor_cli/ ./deeptutor_cli/
+COPY scripts/ ./scripts/
+COPY pyproject.toml ./
+COPY requirements/ ./requirements/
+COPY requirements.txt ./
+
+RUN mkdir -p \
+    data/user/settings \
+    data/memory \
+    data/user/workspace/memory \
+    data/user/workspace/notebook \
+    data/user/workspace/co-writer/audio \
+    data/user/workspace/co-writer/tool_calls \
+    data/user/workspace/chat/chat \
+    data/user/workspace/chat/deep_solve \
+    data/user/workspace/chat/deep_question \
+    data/user/workspace/chat/deep_research/reports \
+    data/user/workspace/chat/math_animator \
+    data/user/workspace/chat/_detached_code_execution \
+    data/user/logs \
+    data/knowledge_bases
+
+RUN groupadd --system --gid 1000 deeptutor \
+    && useradd --system --uid 1000 --gid 1000 --no-create-home --shell /usr/sbin/nologin deeptutor \
+    && chown -R deeptutor:deeptutor /app/data /app/web/.next
+
+RUN mkdir -p /etc/supervisor/conf.d
+
+RUN cat > /etc/supervisor/supervisord.conf <<'EOF'
+[supervisord]
+nodaemon=true
+logfile=/dev/null
+logfile_maxbytes=0
+pidfile=/tmp/supervisord.pid
+
+[include]
+files = /etc/supervisor/conf.d/programs.conf
+EOF
+
+RUN sed -i 's/\r$//' /etc/supervisor/supervisord.conf
+
+RUN cat > /etc/supervisor/conf.d/programs.conf <<'EOF'
+[program:backend]
+command=/bin/bash /app/start-backend.sh
+directory=/app
+user=deeptutor
+autostart=true
+autorestart=true
+stdout_logfile=/dev/fd/1
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/fd/2
+stderr_logfile_maxbytes=0
+environment=PYTHONPATH="/app",PYTHONUNBUFFERED="1"
+
+[program:frontend]
+command=/bin/bash /app/start-frontend.sh
+directory=/app/web
+user=deeptutor
+autostart=true
+autorestart=true
+startsecs=5
+stdout_logfile=/dev/fd/1
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/fd/2
+stderr_logfile_maxbytes=0
+environment=NODE_ENV="production"
+EOF
+
+RUN sed -i 's/\r$//' /etc/supervisor/conf.d/programs.conf
+
+RUN cat > /app/start-backend.sh <<'EOF'
+#!/bin/bash
+set -e
+
+BACKEND_PORT=${BACKEND_PORT:-8001}
+BACKEND_HOST=${BACKEND_HOST:-0.0.0.0}
+BACKEND_WORKERS=${BACKEND_WORKERS:-1}
+
+echo "[Backend]  🚀 Starting FastAPI backend on ${BACKEND_HOST}:${BACKEND_PORT}..."
+
+WS_MAX_SIZE=$(python -c "from deeptutor.services.config import get_ws_max_size; print(get_ws_max_size())" 2>/dev/null || echo 16777216)
+KEEP_ALIVE=$(python -c "from deeptutor.services.config import HTTP_KEEP_ALIVE_TIMEOUT; print(HTTP_KEEP_ALIVE_TIMEOUT)" 2>/dev/null || echo 300)
+exec python -m uvicorn deeptutor.api.main:app --host ${BACKEND_HOST} --port ${BACKEND_PORT} --workers ${BACKEND_WORKERS} --no-access-log --ws-max-size ${WS_MAX_SIZE} --timeout-keep-alive ${KEEP_ALIVE}
+EOF
+
+RUN sed -i 's/\r$//' /app/start-backend.sh && chmod +x /app/start-backend.sh
+
+RUN cat > /app/start-frontend.sh <<'EOF'
+#!/bin/bash
+set -e
+
+FRONTEND_PORT=${FRONTEND_PORT:-3782}
+FRONTEND_HOST=${FRONTEND_HOST:-0.0.0.0}
+echo "[Frontend] 🚀 Starting Next.js frontend on ${FRONTEND_HOST}:${FRONTEND_PORT}..."
+
+export PORT=${FRONTEND_PORT}
+export HOSTNAME=${FRONTEND_HOST}
+exec node /app/web/server.js
+EOF
+
+RUN sed -i 's/\r$//' /app/start-frontend.sh && chmod +x /app/start-frontend.sh
+
+RUN cat > /app/entrypoint.sh <<'EOF'
+#!/bin/bash
+set -e
+
+echo "============================================"
+echo "🚀 Starting DeepTutor"
+echo "============================================"
+
+export DEEPTUTOR_IGNORE_PROCESS_ENV_OVERRIDES=1
+
+for key in \
+    BACKEND_PORT \
+    BACKEND_WORKERS \
+    DEEPTUTOR_BACKEND_WORKERS \
+    FRONTEND_PORT \
+    NEXT_PUBLIC_API_BASE_EXTERNAL \
+    NEXT_PUBLIC_API_BASE \
+    CORS_ORIGIN \
+    CORS_ORIGINS \
+    DISABLE_SSL_VERIFY \
+    CHAT_ATTACHMENT_DIR \
+    AUTH_ENABLED \
+    NEXT_PUBLIC_AUTH_ENABLED \
+    AUTH_USERNAME \
+    AUTH_PASSWORD_HASH \
+    AUTH_TOKEN_EXPIRE_HOURS \
+    AUTH_COOKIE_SECURE \
+    POCKETBASE_URL \
+    POCKETBASE_PORT \
+    POCKETBASE_EXTERNAL_URL \
+    POCKETBASE_ADMIN_EMAIL \
+    POCKETBASE_ADMIN_PASSWORD \
+    DEEPTUTOR_API_BASE_URL \
+    DEEPTUTOR_AUTH_ENABLED; do
+    unset "$key"
+done
+
+echo "📁 Checking data directories..."
+echo "   Ensuring runtime settings and workspace layout..."
+python -c "
+from pathlib import Path
+from deeptutor.services.setup import init_user_directories
+init_user_directories(Path('/app'))
+" 2>/dev/null || echo "   ⚠️ Directory initialization skipped (will be created on first use)"
+
+chown -R deeptutor:deeptutor /app/data 2>/dev/null || true
+
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/app/data/.cache/pip}"
+mkdir -p "$PIP_CACHE_DIR" 2>/dev/null || true
+
+if [ -n "${DEEPTUTOR_APT_PACKAGES:-}" ]; then
+    echo "🔧 Ensuring system packages: ${DEEPTUTOR_APT_PACKAGES}"
+    apt_missing=""
+    for pkg in $(echo "${DEEPTUTOR_APT_PACKAGES}" | tr ',' ' '); do
+        dpkg -s "$pkg" >/dev/null 2>&1 || apt_missing="$apt_missing $pkg"
+    done
+    if [ -z "$apt_missing" ]; then
+        echo "   ✅ System packages already present"
+    elif ! (apt-get update -qq && apt-get install -y --no-install-recommends $apt_missing); then
+        echo "   ⚠️ apt-get failed; these packages stay unavailable:$apt_missing"
+    fi
+fi
+
+if [ -n "${DEEPTUTOR_EXTRAS:-}" ]; then
+    echo "🔧 Ensuring Python extras: ${DEEPTUTOR_EXTRAS}"
+    python /app/scripts/install_extras.py "${DEEPTUTOR_EXTRAS}" || true
+    chown -R deeptutor:deeptutor "$PIP_CACHE_DIR" 2>/dev/null || true
+fi
+
+echo "⚙️  Loading runtime JSON settings..."
+eval "$(python - <<'PY'
+import shlex
+from deeptutor.services.config import export_runtime_settings_to_env
+
+for key, value in export_runtime_settings_to_env(overwrite=True).items():
+    print(f"export {key}={shlex.quote(str(value))}")
+PY
+)"
+
+export BACKEND_PORT=${BACKEND_PORT:-8001}
+export FRONTEND_PORT=${FRONTEND_PORT:-3782}
+
+echo "📌 API Base URL (proxy): ${DEEPTUTOR_API_BASE_URL:-http://localhost:${BACKEND_PORT}}"
+echo "📌 Auth enabled: ${DEEPTUTOR_AUTH_ENABLED:-false}"
+
+echo "📌 Backend Port: ${BACKEND_PORT}"
+echo "📌 Frontend Port: ${FRONTEND_PORT}"
+
+echo "============================================"
+echo "📦 Configuration loaded from:"
+echo "   - data/user/settings/system.json"
+echo "   - data/user/settings/auth.json"
+echo "   - data/user/settings/integrations.json"
+echo "   - data/user/settings/model_catalog.json"
+echo "   - data/user/settings/main.yaml"
+echo "   - data/user/settings/agents.yaml"
+echo "============================================"
+
+exec /usr/bin/supervisord -c /etc/supervisor/supervisord.conf
+EOF
+
+RUN sed -i 's/\r$//' /app/entrypoint.sh && chmod +x /app/entrypoint.sh
+
+RUN cat > /app/healthcheck.py <<'EOF'
+from pathlib import Path
+import json
+import urllib.request
+
+port = 8001
+settings_path = Path("/app/data/user/settings/system.json")
+try:
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    port = int(settings.get("backend_port") or port)
+except Exception:
+    pass
+
+urllib.request.urlopen(f"http://localhost:{port}/health/ready", timeout=5).close()
+EOF
+
+EXPOSE 8001 3782
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD python /app/healthcheck.py
+
+ENTRYPOINT ["/app/entrypoint.sh"]
